@@ -1,0 +1,362 @@
+---
+
+- name: Configuring DATAGUARD between {{primary_db_name}} and {{standby_db_name}}
+  hosts: all
+  vars_files:
+    - /n01/oraadmin1/.ansible/yas/dg_vars.yml
+  tasks:
+    - name: Include Primary TNS into Standby tnsnames.ora file
+      blockinfile:
+         dest: "{{oracle_home}}/network/admin/tnsnames.ora"
+         insertafter: EOF
+         marker: "## {mark} Added by Ansible"
+         state: present
+         block: |
+                {{ primary_db_name|upper }}.{{ hostvars[item]['ansible_domain']|upper }} =
+                (DESCRIPTION =
+                        (ADDRESS = (PROTOCOL = TCP)(HOST = {{ hostvars[item]['ansible_hostname'] }}.{{ hostvars[item]['ansible_domain'] }})(PORT = 1521))
+                        (CONNECT_DATA =
+                        (SERVER = DEDICATED)
+                        (SERVICE_NAME = {{ primary_db_name }}.{{ hostvars[item]['ansible_domain']}})
+                        )
+                )
+      with_items:
+        - "{{ groups.primary_server }}"
+      when: ansible_hostname != item
+
+    - name: Include Standby TNS into Primary tnsnames.ora file
+      blockinfile:
+         dest: "{{oracle_home}}/network/admin/tnsnames.ora"
+         insertafter: EOF
+         marker: "## {mark} Added by Ansible"
+         state: present
+         block: |
+                {{ standby_db_name|upper }}.{{ hostvars[item]['ansible_domain']|upper }} =
+                (DESCRIPTION =
+                        (ADDRESS = (PROTOCOL = TCP)(HOST = {{ hostvars[item]['ansible_hostname'] }}.{{ hostvars[item]['ansible_domain'] }})(PORT = 1521))
+                        (CONNECT_DATA =
+                        (SERVER = DEDICATED)
+                        (SERVICE_NAME = {{ standby_db_name }}.{{ hostvars[item]['ansible_domain']}})
+                        )
+                )
+      with_items:
+        - "{{ groups.standby_server }}"
+      when: ansible_hostname != item
+      tags:
+        - prim_tns
+
+    - name: Configure listener with DG params and reload on Primary
+      blockinfile:
+         dest: /u01/app/11.2.0.4/grid/network/admin/listener.ora
+         insertafter: EOF
+         marker: "## {mark} Added by Ansible"
+         state: present
+         block: |
+                SID_LIST_LISTENER=
+                  (SID_LIST=
+                      (SID_DESC=
+                         (GLOBAL_DBNAME={{ primary_db_name }}_DGMGRL.int.thomsonreuters.com)
+                         (ORACLE_HOME=/u01/app/oracle/product/11.2.0.4/db)
+                         (ENVS="TNS_ADMIN=/u01/app/oracle/product/11.2.0.4/db/network/admin")
+                         (SID_NAME={{ primary_db_name }}1))
+                  )
+      when: ansible_hostname in groups.primary_server
+      notify: Restart listener
+
+    - name: Configure listener with DG params and reload on Standby
+      blockinfile:
+         dest: /u01/app/11.2.0.4/grid/network/admin/listener.ora
+         insertafter: EOF
+         marker: "## {mark} Added by Ansible"
+         state: present
+         block: |
+                SID_LIST_LISTENER=
+                  (SID_LIST=
+                      (SID_DESC=
+                         (GLOBAL_DBNAME={{ standby_db_name }}_DGMGRL.int.thomsonreuters.com)
+                         (ORACLE_HOME=/u01/app/oracle/product/11.2.0.4/db)
+                         (ENVS="TNS_ADMIN=/u01/app/oracle/product/11.2.0.4/db/network/admin")
+                         (SID_NAME={{ standby_db_name }}1))
+                  )
+      when: ansible_hostname in groups.standby_server
+      notify: Restart listener
+
+    - meta: flush_handlers
+
+    - name: Archive log current in Primary
+      shell: >
+         source /home/oracle/.bash_profile;
+         export ORACLE_HOME={{oracle_home}};
+         export ORACLE_SID={{primary_db_name}}1;
+         printf 'alter system archive log current;\n' | $ORACLE_HOME/bin/sqlplus -S / as sysdba
+      when: ansible_hostname in groups.primary_server
+
+    - name: Create standby controlfile in Primary
+      shell: >
+         source /home/oracle/.bash_profile;
+         export ORACLE_HOME={{oracle_home}};
+         export ORACLE_SID={{primary_db_name}}1;
+         printf "alter database create standby controlfile as '/s01/oraadmin1/{{primary_db_name}}/dbs/stbyctrl{{primary_db_name}}1.ctl';\n" | $ORACLE_HOME/bin/sqlplus -S / as sysdba
+      when: ansible_hostname in groups.primary_server
+
+    - name: Create pfile in Primary
+      shell: >
+         source /home/oracle/.bash_profile;
+         export ORACLE_HOME={{oracle_home}};
+         export ORACLE_SID={{primary_db_name}}1;
+         printf "create pfile='{{oracle_home}}/dbs/pfile{{primary_db_name}}1.ora' from spfile;\n" | $ORACLE_HOME/bin/sqlplus -S / as sysdba
+      when: ansible_hostname in groups.primary_server
+
+    - name: Check DG service in Primary
+      shell: >
+         source /home/oracle/.bash_profile;
+         export ORACLE_HOME={{oracle_home}};
+         export ORACLE_SID={{primary_db_name}}1;
+         printf "set feed off head off echo off  pagesize 0\n select 'true' from sys.service$ where name = '{{standby_db_name}}.{{domain_name}}';\n" | $ORACLE_HOME/bin/sqlplus -S / as sysdba
+      register: dg_service
+      when: ansible_hostname in groups.primary_server
+
+    - name: Create DG service if it does not exists in Primary
+      shell: >
+         source /home/oracle/.bash_profile;
+         export ORACLE_HOME={{oracle_home}};
+         export ORACLE_SID={{primary_db_name}}1;
+         printf "EXEC DBMS_SERVICE.CREATE_SERVICE('{{standby_db_name}}.{{domain_name}}','{{standby_db_name}}.{{domain_name}}');\n" | $ORACLE_HOME/bin/sqlplus -S / as sysdba
+      when: ansible_hostname in groups.primary_server and dg_service is not defined
+
+    - name: Take snapshot of Primary DB
+      shell: >
+         source /home/oracle/.bash_profile;
+         export CUR_DATE=`date "+%s"`;
+         /dba/bin/run_hotbackup_netapp.sh -d {{primary_db_name}}1 > /dev/null 2>&1; cd /s01/oradata1/.snapshot;
+         export SNAP_DATE=`ls -lut /s01/oradata1/.snapshot | head -2 | tail -1 | awk '{ print $NF }'| xargs stat -c "%X"`;
+         if [[ $SNAP_DATE -gt $CUR_DATE ]]; then echo "`ls -lut /s01/oradata1/.snapshot | head -2 | tail -1 | awk '{ print $NF }'`"; else echo "Failure"; fi
+      register: db_snap_name
+      when: ansible_hostname in groups.primary_server
+      failed_when: "'Failure' in db_snap_name.stdout"
+      tags:
+        - snap_db
+
+    - name: Configuring ssh key pair on Standby.
+      user:
+        name: oracle
+        generate_ssh_key: yes
+        ssh_key_file: /home/oracle/.ssh/id_rsa
+        ssh_key_type: rsa
+        ssh_key_bits: 4096
+        state: present
+      register: oracle
+      when: ansible_hostname in groups.standby_server
+      tags:
+        - ssh1
+
+    - name: Copy oracle public key to Primary
+      authorized_key:
+        user: oracle
+        path: /home/oracle/.ssh/authorized_keys
+        key: "{{ oracle.ssh_public_key }}"
+      delegate_to: "{{ groups.primary_server[0] }}"
+      when: ansible_hostname in groups.standby_server
+      tags:
+        - ssh2
+
+    - name: Transfering pfile,controlfile,passwordfile and DB files from Primary to Standby
+      synchronize:
+        src: "{{ item.source_dir }}"
+        dest: "{{ item.target_dir }}"
+        mode: pull
+      delegate_to: "{{ groups.standby_server[0] }}"
+      with_items:
+        - {source_dir: "/u01/app/oracle/product/11.2.0.4/db/dbs/pfile{{primary_db_name}}1.ora", target_dir: "/u01/app/oracle/product/11.2.0.4/db/dbs/pfile{{standby_db_name}}1.ora"}
+        - {source_dir: "/s01/oraadmin1/{{primary_db_name}}/dbs/stbyctrl{{primary_db_name}}1.ctl", target_dir: "/n01/oradata1/{{standby_db_name[:-1]}}/{{standby_db_name[:-1]}}_control01.ctl"}
+        - {source_dir: "/s01/oraadmin1/{{primary_db_name}}/dbs/stbyctrl{{primary_db_name}}1.ctl", target_dir: "/n01/oradata1/{{standby_db_name[:-1]}}/{{standby_db_name[:-1]}}_control02.ctl"}
+        - {source_dir: "/s01/oraadmin1/{{primary_db_name}}/dbs/orapw{{primary_db_name}}", target_dir: "/s01/oraadmin1/{{standby_db_name}}/dbs/orapw{{standby_db_name}}"}
+        - {source_dir: "/s01/oradata1/.snapshot/{{db_snap_name.stdout}}/{{primary_db_name[:-1]}}/", target_dir: "/s01/oradata1/{{standby_db_name[:-1]}}/"}
+      when: ansible_hostname in groups.primary_server
+      tags:
+        - transfer_db_files
+
+    - name: Remove standby controlfile
+      file: path="/s01/oradata1/{{standby_db_name[:-1]}}/{{standby_db_name[:-1]}}_control03.ctl" state=absent
+      when: ansible_hostname in groups.standby_server
+      tags:
+        - del_stdby_ctl
+
+    - name: Replace standby controlfile
+      synchronize:
+        src: "{{ item.source_dir }}"
+        dest: "{{ item.target_dir }}"
+        mode: pull
+      delegate_to: "{{ groups.standby_server[0] }}"
+      with_items:
+        - {source_dir: "/s01/oraadmin1/{{primary_db_name}}/dbs/stbyctrl{{primary_db_name}}1.ctl", target_dir: "/s01/oradata1/{{standby_db_name[:-1]}}/{{standby_db_name[:-1]}}_control03.ctl"}
+      when: ansible_hostname in groups.primary_server
+      tags:
+        - rep_stdby_ctl
+
+    - name: Remove ssh key pair on Primary and Standby
+      file: path="/home/oracle/.ssh/id_rsa" state=absent
+
+    - name: Update pfile on Standby
+      lineinfile:
+        dest: "{{ oracle_home }}/dbs/pfile{{standby_db_name}}1.ora"
+        regexp: "{{item.reg_exp}}"
+        line: "{{item.line_to_replace}}"
+      with_items:
+        - {reg_exp: '^\*\.db_unique_name=', line_to_replace: "*.db_unique_name='{{standby_db_name}}'"}
+        - {reg_exp: '^\*\.db_domain=', line_to_replace: "*.db_domain='{{domain_name}}'"}
+        - {reg_exp: '^\*\.dg_broker_config_file1=', line_to_replace: "*.dg_broker_config_file1='/s01/oraadmin1/{{standby_db_name}}/dbs/dr1{{standby_db_name}}.dat'"}
+        - {reg_exp: '^\*\.dg_broker_config_file2=', line_to_replace: "*.dg_broker_config_file2='/s01/oraadmin1/{{standby_db_name}}/dbs/dr2{{standby_db_name}}.dat'"}
+        - {reg_exp: '^\*\.fal_client=', line_to_replace: "*.fal_client='{{standby_db_name|upper}}'"}
+        - {reg_exp: '^\*\.fal_server=', line_to_replace: "*.fal_server='{{primary_db_name|upper}}'"}
+        - {reg_exp: '^\*\.log_archive_dest_1=', line_to_replace: "*.log_archive_dest_1='LOCATION=/n01/oraarch1/{{standby_db_name}} valid_for=(ONLINE_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME={{standby_db_name}} REOPEN=30 MAX_FAILURE=3 ALTERNATE=LOG_ARCHIVE_DEST_4'"}
+        - {reg_exp: '^\*\.log_archive_dest_2=', line_to_replace: "*.log_archive_dest_2='service={{primary_db_name|upper}} LGWR ASYNC NOAFFIRM db_unique_name={{primary_db_name}} net_timeout=30 valid_for=(all_logfiles,primary_role)'"}
+        - {reg_exp: '^\*\.log_archive_dest_3=', line_to_replace: "*.log_archive_dest_3='LOCATION=/n01/oraarch1/{{standby_db_name}}_standby/ valid_for=(STANDBY_LOGFILES,STANDBY_ROLE) DB_UNIQUE_NAME={{standby_db_name}} REOPEN=30 MAX_FAILURE=3 ALTERNATE=LOG_ARCHIVE_DEST_5'"}
+        - {reg_exp: '^\*\.log_archive_dest_4=', line_to_replace: "*.log_archive_dest_4='LOCATION=/n01/oraarch2/{{standby_db_name}} valid_for=(ONLINE_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME={{standby_db_name}}'"}
+        - {reg_exp: '^\*\.log_archive_dest_5=', line_to_replace: "*.log_archive_dest_5='LOCATION=/n01/oraarch2/{{standby_db_name}}_standby/ valid_for=(STANDBY_LOGFILES,STANDBY_ROLE) DB_UNIQUE_NAME={{standby_db_name}}'"}
+        - {reg_exp: '^\*\.log_archive_dest_state_2=', line_to_replace: "*.log_archive_dest_state_2='DEFER'"}
+        - {reg_exp: '^\*\.service_names=', line_to_replace: "*.service_names='{{standby_db_name}}.{{domain_name}}'"}
+        - {reg_exp: '^\*\.log_file_name_convert=', line_to_replace: "*.log_file_name_convert='/n01/oradata1/{{standby_db_name[:-1]}}/{{primary_db_name}}','/n01/oradata1/{{standby_db_name[:-1]}}/{{standby_db_name}}'"}
+        - {reg_exp: '^\*\.audit_file_dest=', line_to_replace: "*.audit_file_dest='/n01/oraadmin1/{{standby_db_name}}1/adump'"}
+        - {reg_exp: '^\*\.instance_name=', line_to_replace: "*.instance_name='{{standby_db_name}}1'"}
+      when: ansible_hostname in groups.standby_server
+      tags:
+        - update_stdby_params
+
+    - name: Create spfile from pfile on standby
+      shell: >
+        source /home/oracle/.bash_profile;
+        export ORACLE_HOME={{oracle_home}};
+        export ORACLE_SID={{standby_db_name}}1;
+        printf "create spfile='/s01/oraadmin1/{{standby_db_name}}/dbs/spfile{{standby_db_name}}.ora' from pfile='{{oracle_home}}/dbs/pfile{{standby_db_name}}1.ora';\n"|$ORACLE_HOME/bin/sqlplus -S / as sysdba
+      when: ansible_hostname in groups.standby_server
+
+    - name: Move standby alert logfile
+      shell: >
+        cat /dev/null > /n01/oraadmin1/diag/rdbms/{{standby_db_name}}/{{standby_db_name}}1/trace/alert_{{standby_db_name}}1.log
+      when: ansible_hostname in groups.standby_server
+      tags:
+        - move_log
+
+    - name: Startup Standby DB in mount state
+      shell: >
+        source /home/oracle/.bash_profile;
+        export ORACLE_HOME={{oracle_home}};
+        export ORACLE_SID={{standby_db_name}}1;
+        printf "startup mount\n" | $ORACLE_HOME/bin/sqlplus -S / as sysdba
+      when: ansible_hostname in groups.standby_server
+      tags:
+        - start_db
+
+    - name: Wait for Standby to mount before proceeding...
+      wait_for:
+        path: /n01/oraadmin1/diag/rdbms/{{standby_db_name}}/{{standby_db_name}}1/trace/alert_{{standby_db_name}}1.log
+        search_regex: "INSV started"
+        delay: 10
+        timeout: 3600
+      register: standby_mount_status
+      when: ansible_hostname in groups.standby_server
+      tags:
+        - wait_for_mount
+
+    #- name: waiting for a few seconds to let the database start
+    #  pause:
+    #    seconds: 20
+    #  when: ansible_hostname in groups.standby_server
+
+    - name: Enable log_archive_dest_state_2 on Primary
+      shell: >
+        source /home/oracle/.bash_profile;
+        export ORACLE_HOME={{oracle_home}};
+        export ORACLE_SID={{primary_db_name}}1;
+        printf "ALTER SYSTEM SET log_archive_dest_state_2=enable scope=both;\n" | $ORACLE_HOME/bin/sqlplus -S / as sysdba
+      when: ansible_hostname in groups.primary_server
+
+    - name: Start MRP on Standby
+      shell: >
+        source /home/oracle/.bash_profile;
+        export ORACLE_HOME={{oracle_home}};
+        export ORACLE_SID={{standby_db_name}}1;
+        printf "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION;\n" | $ORACLE_HOME/bin/sqlplus -S / as sysdba
+      when: ansible_hostname in groups.standby_server
+
+    - name: Switch logs on primary
+      shell: >
+        source /home/oracle/.bash_profile;
+        export ORACLE_HOME={{oracle_home}};
+        export ORACLE_SID={{primary_db_name}}1;
+        printf "ALTER SYSTEM ARCHIVE LOG CURRENT\n" | $ORACLE_HOME/bin/sqlplus -S / as sysdba
+      when: ansible_hostname in groups.primary_server
+
+    - name: Wait for Standby synchronization before proceeding...
+      wait_for:
+        path: /n01/oraadmin1/diag/rdbms/{{standby_db_name}}/{{standby_db_name}}1/trace/alert_{{standby_db_name}}1.log
+        search_regex: "(in transit)"
+        delay: 10
+        timeout: 3600
+      register: standby_sync_status
+      when: ansible_hostname in groups.standby_server
+      tags:
+        - wait_for_sync
+
+    - name: Fail playbook if Standby is not in sync
+      fail: msg="Standby is not getting sync with primary !!"
+      when: standby_sync_status|failed
+
+    - name: Cancel recovery
+      shell: >
+        source /home/oracle/.bash_profile;
+        export ORACLE_HOME={{oracle_home}};
+        export ORACLE_SID={{standby_db_name}}1;
+        printf "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;\n" | $ORACLE_HOME/bin/sqlplus -S / as sysdba
+      when: ansible_hostname in groups.standby_server
+
+    - name: Register and online DB into CRS on Standby
+      shell: >
+        source /home/oracle/.bash_profile;
+        export ORACLE_HOME={{oracle_home}};
+        export ORACLE_SID={{standby_db_name}}1;
+        $ORACLE_HOME/bin/srvctl add database -d {{standby_db_name}} -o {{oracle_home}} -i {{standby_db_name}}1;
+        $ORACLE_HOME/bin/srvctl add instance -d {{standby_db_name}} -i {{standby_db_name}}1 -n {{hostvars[item]['ansible_hostname']}};
+        $ORACLE_HOME/bin/srvctl start database -d {{standby_db_name}}
+      with_items:
+        - "{{ groups.standby_server }}"
+      when: ansible_hostname in groups.standby_server
+
+    - name: Shutdown Standby DB
+      #shell: /dba/bin/stop_oracle -d {{standby_db_name}}
+      shell: source /home/oracle/.bash_profile; $ORACLE_HOME/bin/srvctl stop database -d {{standby_db_name}}
+      when: ansible_hostname in groups.standby_server
+      tags:
+        - shut_db
+
+    - name: Register Standby DB mode as activedg
+      shell: /dba/bin/register_dbmode -i {{standby_db_name}}1 -t activedg
+      when: ansible_hostname in groups.standby_server
+
+    - name: Start up Standby DB
+      #shell: /dba/bin/start_oracle -d {{standby_db_name}}
+      shell: source /home/oracle/.bash_profile; $ORACLE_HOME/bin/srvctl start database -d {{standby_db_name}}
+      when: ansible_hostname in groups.standby_server
+
+    - name: Start MRP with real time apply
+      shell: >
+        source /home/oracle/.bash_profile;
+        export ORACLE_HOME={{oracle_home}};
+        export ORACLE_SID={{standby_db_name}}1;
+        printf "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT;\n" | $ORACLE_HOME/bin/sqlplus -S / as sysdba
+      when: ansible_hostname in groups.standby_server
+
+    - name: Generate DGMGRL script
+      template: src=/n01/oraadmin1/.ansible/yas/roles/createdb/templates/dgmgrl.sh.j2 dest=/s01/oraadmin1/{{primary_db_name}}1/scripts/dgmgrl_{{primary_db_name}}.sh owner=oracle group=dba mode=755 force=yes
+      when: ansible_hostname in groups.primary_server
+      tags:
+        - gen_dgmgrl_script
+
+    - name: Create DataGuard broker configuration
+      shell: source /home/oracle/.bash_profile; sh /s01/oraadmin1/{{primary_db_name}}1/scripts/dgmgrl_{{primary_db_name}}.sh
+      when: ansible_hostname in groups.primary_server
+
+  handlers:
+    - name: Restart listener
+      shell: "source /home/oracle/.bash_profile && /u01/app/oracle/product/11.2.0.4/db/bin/lsnrctl reload"
